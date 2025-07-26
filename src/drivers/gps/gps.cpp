@@ -85,7 +85,8 @@ using namespace device;
 using namespace time_literals;
 
 #define TIMEOUT_1HZ		1300	//!< Timeout time in mS, 1000 mS (1Hz) + 300 mS delta for error
-#define TIMEOUT_5HZ		500		//!< Timeout time in mS,  200 mS (5Hz) + 300 mS delta for error
+#define TIMEOUT_5HZ		500	//!< Timeout time in mS,  200 mS (5Hz) + 300 mS delta for error
+#define TIMEOUT_DUMP_ADD	450	//!< Additional time in mS to account for RTCM3 parsing and dumping
 #define RATE_MEASUREMENT_PERIOD 5_s
 
 enum class gps_driver_mode_t {
@@ -189,8 +190,6 @@ private:
 
 	sensor_gps_s			_report_gps_pos{};				///< uORB topic for gps position
 	satellite_info_s		*_p_report_sat_info{nullptr};			///< pointer to uORB topic for satellite info
-	uint8_t                         _spoofing_state{0};                             ///< spoofing state
-	uint8_t                         _jamming_state{0};                              ///< jamming state
 
 	uORB::PublicationMulti<sensor_gps_s>	_report_gps_pos_pub{ORB_ID(sensor_gps)};	///< uORB pub for gps position
 	uORB::PublicationMulti<sensor_gnss_relative_s> _sensor_gnss_relative_pub{ORB_ID(sensor_gnss_relative)};
@@ -448,7 +447,7 @@ int GPS::callback(GPSCallbackType type, void *data1, int data2, void *user)
 
 		px4_clock_gettime(CLOCK_REALTIME, &rtc_system_time);
 		timespec rtc_gps_time = *(timespec *)data1;
-		int drift_time = abs(rtc_system_time.tv_sec - rtc_gps_time.tv_sec);
+		int drift_time = abs(static_cast<long>(rtc_system_time.tv_sec - rtc_gps_time.tv_sec));
 
 		if (drift_time >= SET_CLOCK_DRIFT_TIME_S) {
 			// as of 2021 setting the time on Nuttx temporarily pauses interrupts
@@ -547,8 +546,13 @@ void GPS::handleInjectDataTopic()
 		for (int instance = 0; instance < _orb_inject_data_sub.size(); instance++) {
 			const bool exists = _orb_inject_data_sub[instance].advertised();
 
-			if (exists) {
-				if (_orb_inject_data_sub[instance].copy(&msg)) {
+			if (exists && _orb_inject_data_sub[instance].copy(&msg)) {
+				/* Don't select the own RTCM instance. In case it has a lower
+				 * instance number, it will be selected and will be rejected
+				 * later in the code, resulting in no RTCM injection at all.
+				 */
+				if (msg.device_id != get_device_id()) {
+					// Only use the message if it is up to date
 					if ((hrt_absolute_time() - msg.timestamp) < 5_s) {
 						// Remember that we already did a copy on this instance.
 						already_copied = true;
@@ -905,6 +909,15 @@ GPS::run()
 
 		gpsConfig.interface_protocols = static_cast<GPSHelper::InterfaceProtocolsMask>(gps_ubx_cfg_intf);
 
+		int32_t gps_cfg_wipe = 0;
+		handle = param_find("GPS_CFG_WIPE");
+
+		if (handle != PARAM_INVALID) {
+			param_get(handle, &gps_cfg_wipe);
+		}
+
+		gpsConfig.cfg_wipe = static_cast<bool>(gps_cfg_wipe);
+
 		if (_helper && _helper->configure(_baudrate, gpsConfig) == 0) {
 
 			/* reset report */
@@ -958,6 +971,12 @@ GPS::run()
 				/* The MB rover will wait as long as possible to compute a navigation solution,
 				 * possibly lowering the navigation rate all the way to 1 Hz while doing so. */
 				receive_timeout = TIMEOUT_1HZ;
+			}
+
+			if (_dump_communication_mode != gps_dump_comm_mode_t::Disabled) {
+				/* Dumping the RTCM3/UBX data requires additional parsing and storing of data via uORB.
+				 * Without additional time this can lead to timeouts. */
+				receive_timeout += TIMEOUT_DUMP_ADD;
 			}
 
 			while ((helper_ret = _helper->receive(receive_timeout)) > 0 && !should_exit()) {
@@ -1193,25 +1212,6 @@ GPS::publish()
 		// The uORB message definition requires this data to be set to a NAN if no new valid data is available.
 		_report_gps_pos.heading = NAN;
 		_is_gps_main_advertised.store(true);
-
-		if (_report_gps_pos.spoofing_state != _spoofing_state) {
-
-			if (_report_gps_pos.spoofing_state > sensor_gps_s::SPOOFING_STATE_NONE) {
-				PX4_WARN("GPS spoofing detected! (state: %d)", _report_gps_pos.spoofing_state);
-			}
-
-			_spoofing_state = _report_gps_pos.spoofing_state;
-		}
-
-		if (_report_gps_pos.jamming_state != _jamming_state) {
-
-			if (_report_gps_pos.jamming_state > sensor_gps_s::JAMMING_STATE_WARNING) {
-				PX4_WARN("GPS jamming detected! (state: %d) (indicator: %d)", _report_gps_pos.jamming_state,
-					 (uint8_t)_report_gps_pos.jamming_indicator);
-			}
-
-			_jamming_state = _report_gps_pos.jamming_state;
-		}
 	}
 }
 

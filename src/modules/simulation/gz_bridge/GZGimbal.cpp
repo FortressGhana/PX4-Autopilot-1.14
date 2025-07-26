@@ -49,6 +49,8 @@ bool GZGimbal::init(const std::string &world_name, const std::string &model_name
 		return false;
 	}
 
+	pthread_mutex_init(&_node_mutex, nullptr);
+
 	updateParameters();
 
 	ScheduleOnInterval(200_ms); // @5Hz
@@ -238,6 +240,11 @@ float GZGimbal::computeJointSetpoint(const float att_stp, const float rate_stp, 
 {
 
 	if (PX4_ISFINITE(rate_stp)) {
+		if (math::abs_t(rate_stp) < FLT_EPSILON) {
+			// Handle zero velocity by sending the last target angle
+			return last_stp;
+		}
+
 		const float rate_diff = dt * rate_stp;
 		const float stp_from_rate = last_stp + rate_diff;
 
